@@ -54,7 +54,7 @@ cat > /usr/local/etc/xray/will666.json << END
     },
         {
             "tag": "vless-xtls",
-            "port": 1369,
+            "port": 443,
             "protocol": "vless",
             "settings": {
                 "clients": [
