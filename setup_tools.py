@@ -3,15 +3,17 @@
 """
 AIO public-safe standalone setup for Termux.
 
+Fixed v4: preserves legacy base call `java -jar $PREFIX/bin/apksigner.jar` by installing a real compatible apksigner.jar.
+
 This version intentionally does NOT hardcode private repository names,
 private resource filenames, private signing-key URLs, or protector internals.
 
 Usage:
-  python aio_setup_tools_public_safe.py
-  python aio_setup_tools_public_safe.py --verify-only
-  python aio_setup_tools_public_safe.py --minimal
-  python aio_setup_tools_public_safe.py --manifest-file ./aio_setup_manifest.json
-  python aio_setup_tools_public_safe.py --manifest-url https://example.com/aio_setup_manifest.json
+  python aio_setup_tools_public_safe_v3_apksigner_fix.py
+  python aio_setup_tools_public_safe_v3_apksigner_fix.py --verify-only
+  python aio_setup_tools_public_safe_v3_apksigner_fix.py --minimal
+  python aio_setup_tools_public_safe_v3_apksigner_fix.py --manifest-file ./aio_setup_manifest.json
+  python aio_setup_tools_public_safe_v3_apksigner_fix.py --manifest-url https://example.com/aio_setup_manifest.json
 
 Optional manifest format:
 {
@@ -24,6 +26,7 @@ Optional manifest format:
 Notes:
   - clang.zip is never required by default. Use the Termux clang package instead.
   - Any manifest item can be optional with {"required": false}.
+  - apksigner is installed as $PREFIX/bin/apksigner.jar so old/base script calls keep working.
 """
 
 import os
@@ -59,6 +62,7 @@ MARKER = SHARE_PATH / ".aio_public_setup_ready"
 APKSIGNER_OPT = PREFIX / "opt" / "aio-apksigner-sdk"
 APKSIGNER_LIB = APKSIGNER_OPT / "lib"
 APKSIGNER_WRAPPER = BIN_PATH / "aio-apksigner-sdk"
+APKSIGNER_JAR = BIN_PATH / "apksigner.jar"
 BUILD_TOOLS_URLS = [
     "https://dl.google.com/android/repository/build-tools_r35_linux.zip",
     "https://dl.google.com/android/repository/build-tools_r34_linux.zip",
@@ -79,7 +83,8 @@ PUBLIC_DOWNLOADS = [
 
 TOOL_GROUPS_CORE = {
     "java": ["java"], "zip": ["zip"], "unzip": ["unzip"], "7z": ["7z"],
-    "curl": ["curl"], "aapt": ["aapt"], "zipalign": ["zipalign"], "apksigner-sdk": ["aio-apksigner-sdk"],
+    "curl": ["curl"], "aapt": ["aapt"], "zipalign": ["zipalign"],
+    "apksigner.jar": ["apksigner.jar"],
     "clang": ["clang"], "readelf": ["llvm-readelf", "readelf"], "strip": ["llvm-strip", "strip"],
     "smali": ["smaliwill"], "baksmali": ["baksmaliwill"],
 }
@@ -222,22 +227,273 @@ def safe_extract_zip(zip_path, dst_dir):
                 raise RuntimeError(f"unsafe zip entry: {m.filename}")
         z.extractall(dst_dir)
 
+
 def probe_apksigner_sdk(path=APKSIGNER_WRAPPER):
+    """Return True only for Android SDK apksigner CLI, not Termux lightweight apksigner."""
     try:
         path = Path(path)
         if not path.exists():
             return False
-        p = subprocess.run([str(path), "sign", "--help"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=25)
+        p = subprocess.run([str(path), "sign", "--help"], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, text=True, timeout=25)
         out = p.stdout or ""
-        return "--ks" in out and "--v2-signing-enabled" in out
-    except Exception:
+        return ("--ks" in out and "--v2-signing-enabled" in out)
+    except Exception as e:
+        log_write(f"probe_apksigner_sdk error: {type(e).__name__}: {e}")
         return False
 
+
+
+def probe_legacy_apksigner_jar(path=APKSIGNER_JAR):
+    """Return True when the old/base call `java -jar apksigner.jar` works."""
+    try:
+        path = Path(path)
+        if not path.exists() or path.stat().st_size < 51200:
+            return False
+        if not shutil.which("java"):
+            return False
+        p = subprocess.run(["java", "-jar", str(path), "sign", "--help"],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           text=True, timeout=35)
+        out = p.stdout or ""
+        return ("--ks" in out and "--v2-signing-enabled" in out)
+    except Exception as e:
+        log_write(f"probe_legacy_apksigner_jar error: {type(e).__name__}: {e}")
+        return False
+
+
+def create_legacy_apksigner_fat_jar(lib_dir):
+    """
+    Build a self-contained $PREFIX/bin/apksigner.jar from Android SDK build-tools jars.
+
+    This intentionally preserves the base protector call style:
+        java -jar $PREFIX/bin/apksigner.jar ...
+
+    We do NOT create a shell masquerading as a jar. We create a real executable jar
+    with Main-Class com.android.apksigner.ApkSignerTool and merged dependencies.
+    """
+    lib_dir = Path(lib_dir)
+    jars = []
+    main = lib_dir / "apksigner.jar"
+    if main.is_file():
+        jars.append(main)
+    for j in sorted(lib_dir.glob("*.jar")):
+        if j not in jars:
+            jars.append(j)
+    if not jars:
+        raise RuntimeError(f"no apksigner SDK jars found in {lib_dir}")
+
+    BIN_PATH.mkdir(parents=True, exist_ok=True)
+    tmp = APKSIGNER_JAR.with_suffix(".jar.tmp")
+    if tmp.exists():
+        try: tmp.unlink()
+        except Exception: pass
+
+    manifest = (
+        "Manifest-Version: 1.0\r\n"
+        "Main-Class: com.android.apksigner.ApkSignerTool\r\n"
+        "Created-By: AIO setup legacy apksigner compatibility\r\n"
+        "\r\n"
+    ).encode("utf-8")
+
+    skip_ext = (".SF", ".RSA", ".DSA", ".EC")
+    seen = {"META-INF/MANIFEST.MF"}
+    copied = 0
+    with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as out:
+        out.writestr("META-INF/MANIFEST.MF", manifest)
+        for jar in jars:
+            try:
+                with zipfile.ZipFile(jar, "r") as zin:
+                    for info_z in zin.infolist():
+                        name = info_z.filename.replace("\\", "/")
+                        upper = name.upper()
+                        if not name or name.endswith("/"):
+                            continue
+                        if upper == "META-INF/MANIFEST.MF":
+                            continue
+                        if upper.startswith("META-INF/") and upper.endswith(skip_ext):
+                            continue
+                        if name in seen:
+                            continue
+                        data = zin.read(info_z.filename)
+                        zi = zipfile.ZipInfo(name)
+                        zi.date_time = (1980, 1, 1, 0, 0, 0)
+                        zi.compress_type = zipfile.ZIP_DEFLATED
+                        out.writestr(zi, data)
+                        seen.add(name)
+                        copied += 1
+            except Exception as e:
+                log_write(f"merge jar error {jar}: {type(e).__name__}: {e}")
+    tmp.replace(APKSIGNER_JAR)
+    os.chmod(APKSIGNER_JAR, 0o644)
+    ok(f"legacy apksigner.jar dibuat: {APKSIGNER_JAR.name} ({copied} entries)")
+    return APKSIGNER_JAR
+
+
+def ensure_legacy_apksigner_jar(download_sdk=True):
+    """
+    Ensure the old/base apksigner invocation works:
+        java -jar $PREFIX/bin/apksigner.jar ...
+
+    This is the Android 16/Termux compatibility fix: the protector may keep calling
+    apksigner.jar exactly like before, while setup guarantees the jar exists and is executable.
+    """
+    if probe_legacy_apksigner_jar(APKSIGNER_JAR):
+        ok("legacy apksigner.jar tersedia")
+        return True
+
+    # If user has a real SDK apksigner lib dir, build the compat jar from it.
+    lib_dir = find_existing_apksigner_lib_dir()
+    if not lib_dir and download_sdk:
+        lib_dir = download_and_install_buildtools_apksigner()
+    if lib_dir:
+        create_legacy_apksigner_fat_jar(lib_dir)
+        if probe_legacy_apksigner_jar(APKSIGNER_JAR):
+            ok("legacy apksigner.jar siap untuk base script")
+            return True
+
+    warn("apksigner.jar belum siap. Jalankan setup dengan internet aktif atau set ANDROID_HOME/ANDROID_SDK_ROOT.")
+    return False
+
 def make_apksigner_wrapper(lib_dir):
+    """Create $PREFIX/bin/aio-apksigner-sdk from a build-tools lib directory."""
     lib_dir = Path(lib_dir)
     BIN_PATH.mkdir(parents=True, exist_ok=True)
     APKSIGNER_OPT.mkdir(parents=True, exist_ok=True)
-    script = f
+    script = (
+        '#!/data/data/com.termux/files/usr/bin/sh\n'
+        '# SDK-style apksigner wrapper generated by AIO public setup.\n'
+        f'DIR="{str(lib_dir)}"\n'
+        'CP=""\n'
+        'for j in "$DIR"/*.jar; do\n'
+        '  if [ -f "$j" ]; then\n'
+        '    if [ -z "$CP" ]; then CP="$j"; else CP="$CP:$j"; fi\n'
+        '  fi\n'
+        'done\n'
+        'if [ -z "$CP" ]; then\n'
+        '  echo "AIO apksigner wrapper error: no jars in $DIR" >&2\n'
+        '  exit 2\n'
+        'fi\n'
+        'exec java -cp "$CP" com.android.apksigner.ApkSignerTool "$@"\n'
+    )
+    APKSIGNER_WRAPPER.write_text(script, encoding="utf-8")
+    APKSIGNER_WRAPPER.chmod(APKSIGNER_WRAPPER.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    ok(f"wrapper: {APKSIGNER_WRAPPER}")
+    return APKSIGNER_WRAPPER
+
+
+def find_existing_sdk_apksigner():
+    candidates = []
+    env = os.environ.get("AIO_APKSIGNER", "").strip()
+    if env:
+        candidates.append(Path(env))
+    for env_name in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+        root = os.environ.get(env_name, "").strip()
+        if root:
+            bt = Path(root) / "build-tools"
+            if bt.is_dir():
+                for child in sorted(bt.iterdir(), reverse=True):
+                    candidates.append(child / "apksigner")
+    candidates.append(APKSIGNER_WRAPPER)
+    for c in candidates:
+        if probe_apksigner_sdk(c):
+            return c
+    return None
+
+
+def find_existing_apksigner_lib_dir():
+    dirs = [APKSIGNER_LIB]
+    for env_name in ("ANDROID_HOME", "ANDROID_SDK_ROOT"):
+        root = os.environ.get(env_name, "").strip()
+        if root:
+            bt = Path(root) / "build-tools"
+            if bt.is_dir():
+                for child in sorted(bt.iterdir(), reverse=True):
+                    dirs.append(child / "lib")
+    dirs.append(BIN_PATH)
+    for d in dirs:
+        if (d / "apksigner.jar").is_file():
+            return d
+    return None
+
+
+def copy_apksigner_libs_from_extracted(root):
+    found = []
+    for p in Path(root).rglob("apksigner.jar"):
+        if p.is_file():
+            found.append(p.parent)
+    if not found:
+        return None
+    src = found[0]
+    APKSIGNER_LIB.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for jar in src.glob("*.jar"):
+        shutil.copy2(jar, APKSIGNER_LIB / jar.name)
+        copied += 1
+    ok(f"copied {copied} apksigner jar(s)")
+    return APKSIGNER_LIB
+
+
+def download_and_install_buildtools_apksigner():
+    if not shutil.which("java"):
+        raise RuntimeError("java tidak ditemukan. Install openjdk dulu.")
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        last_err = None
+        for url in BUILD_TOOLS_URLS:
+            zip_path = td / "build-tools.zip"
+            info(f"Download Android build-tools public: {url.rsplit('/',1)[-1]}")
+            try:
+                if not download_file(url, zip_path, 5 * 1024 * 1024):
+                    continue
+                xdir = td / "x"
+                xdir.mkdir(parents=True, exist_ok=True)
+                safe_extract_zip(zip_path, xdir)
+                lib_dir = copy_apksigner_libs_from_extracted(xdir)
+                if lib_dir:
+                    return lib_dir
+            except Exception as e:
+                last_err = e
+                log_write(f"build-tools download/extract error: {type(e).__name__}: {e}")
+        raise RuntimeError(f"gagal mendapatkan SDK apksigner public: {last_err}")
+
+
+def ensure_apksigner_sdk(download_sdk=True):
+    """
+    Ensure SDK-style apksigner wrapper exists and works.
+
+    This intentionally does not use /usr/bin/apksigner.jar and does not rely on
+    Termux's lightweight `apksigner` CLI. The protector calls this wrapper.
+    """
+    if probe_apksigner_sdk(APKSIGNER_WRAPPER):
+        ok("SDK-style apksigner tersedia")
+        return True
+
+    existing = find_existing_sdk_apksigner()
+    if existing:
+        if existing != APKSIGNER_WRAPPER:
+            APKSIGNER_WRAPPER.write_text(
+                f'#!/data/data/com.termux/files/usr/bin/sh\nexec "{existing}" "$@"\n',
+                encoding="utf-8",
+            )
+            APKSIGNER_WRAPPER.chmod(APKSIGNER_WRAPPER.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        ok(f"SDK apksigner existing: {existing}")
+        return probe_apksigner_sdk(APKSIGNER_WRAPPER)
+
+    lib_dir = find_existing_apksigner_lib_dir()
+    if not lib_dir and download_sdk:
+        lib_dir = download_and_install_buildtools_apksigner()
+    if lib_dir:
+        make_apksigner_wrapper(lib_dir)
+        if probe_apksigner_sdk(APKSIGNER_WRAPPER):
+            ok("SDK-style apksigner siap")
+            return True
+
+    warn("SDK-style apksigner belum siap. Jalankan setup dengan internet aktif atau set ANDROID_HOME/ANDROID_SDK_ROOT.")
+    return False
+
+
+def ensure_jadx(skip=False):
     if skip: warn("skip jadx (--minimal)"); return True
     if shutil.which("jadx"): ok("jadx tersedia"); return True
     pkg_install(["jadx"])
@@ -300,6 +556,10 @@ def verify(minimal=False, manifest_downloads=None):
     groups=dict(TOOL_GROUPS_CORE)
     if not minimal: groups.update(TOOL_GROUPS_OPTIONAL)
     for label,names in groups.items():
+        if label == "apksigner.jar":
+            if not probe_legacy_apksigner_jar(APKSIGNER_JAR):
+                missing_tools.append(label)
+            continue
         if not which_any(names): missing_tools.append(label)
     missing_files=[]
     for d in PUBLIC_DOWNLOADS + manifest_downloads:
@@ -335,7 +595,7 @@ def main():
     force="--force" in aset
     no_public_downloads="--no-public-downloads" in aset
     manifest_downloads=load_manifest(args)
-    print(c("AIO Public-Safe Setup Tools", BLUE))
+    print(c("AIO Public-Safe Setup Tools v4", BLUE))
     print("Log:", LOG_FILE)
     print("PREFIX:", PREFIX)
     print("TOOLKIT_DIR:", TOOLKIT_DIR)
@@ -353,7 +613,7 @@ def main():
     if not minimal:
         info("Install paket optional"); pkg_install(OPTIONAL_PACKAGES)
     info("Cek Java"); ensure_java()
-    info("Setup SDK-style apksigner"); ensure_apksigner_sdk()
+    info("Setup legacy apksigner.jar compatible"); ensure_legacy_apksigner_jar(download_sdk=True)
     info("Install Python modules"); pip_install(PY_MODULES)
     if not no_public_downloads:
         info("Download public upstream tools")
