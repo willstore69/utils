@@ -33,6 +33,8 @@ import time
 import shlex
 import shutil
 import zipfile
+import tempfile
+import stat
 import urllib.request
 import subprocess
 from pathlib import Path
@@ -54,6 +56,15 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / f"aio_setup_public_{int(time.time())}.log"
 MARKER = SHARE_PATH / ".aio_public_setup_ready"
 
+APKSIGNER_OPT = PREFIX / "opt" / "aio-apksigner-sdk"
+APKSIGNER_LIB = APKSIGNER_OPT / "lib"
+APKSIGNER_WRAPPER = BIN_PATH / "aio-apksigner-sdk"
+BUILD_TOOLS_URLS = [
+    "https://dl.google.com/android/repository/build-tools_r35_linux.zip",
+    "https://dl.google.com/android/repository/build-tools_r34_linux.zip",
+    "https://dl.google.com/android/repository/build-tools_r33_linux.zip",
+]
+
 CORE_PACKAGES = ["python", "aapt", "android-tools", "clang", "binutils", "p7zip", "zip", "unzip", "curl"]
 OPTIONAL_PACKAGES = ["radare2"]
 JAVA_PACKAGES = ["openjdk-21", "openjdk-17", "openjdk-11"]
@@ -68,7 +79,7 @@ PUBLIC_DOWNLOADS = [
 
 TOOL_GROUPS_CORE = {
     "java": ["java"], "zip": ["zip"], "unzip": ["unzip"], "7z": ["7z"],
-    "curl": ["curl"], "aapt": ["aapt"], "zipalign": ["zipalign"],
+    "curl": ["curl"], "aapt": ["aapt"], "zipalign": ["zipalign"], "apksigner-sdk": ["aio-apksigner-sdk"],
     "clang": ["clang"], "readelf": ["llvm-readelf", "readelf"], "strip": ["llvm-strip", "strip"],
     "smali": ["smaliwill"], "baksmali": ["baksmaliwill"],
 }
@@ -211,7 +222,22 @@ def safe_extract_zip(zip_path, dst_dir):
                 raise RuntimeError(f"unsafe zip entry: {m.filename}")
         z.extractall(dst_dir)
 
-def ensure_jadx(skip=False):
+def probe_apksigner_sdk(path=APKSIGNER_WRAPPER):
+    try:
+        path = Path(path)
+        if not path.exists():
+            return False
+        p = subprocess.run([str(path), "sign", "--help"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=25)
+        out = p.stdout or ""
+        return "--ks" in out and "--v2-signing-enabled" in out
+    except Exception:
+        return False
+
+def make_apksigner_wrapper(lib_dir):
+    lib_dir = Path(lib_dir)
+    BIN_PATH.mkdir(parents=True, exist_ok=True)
+    APKSIGNER_OPT.mkdir(parents=True, exist_ok=True)
+    script = f
     if skip: warn("skip jadx (--minimal)"); return True
     if shutil.which("jadx"): ok("jadx tersedia"); return True
     pkg_install(["jadx"])
@@ -327,6 +353,7 @@ def main():
     if not minimal:
         info("Install paket optional"); pkg_install(OPTIONAL_PACKAGES)
     info("Cek Java"); ensure_java()
+    info("Setup SDK-style apksigner"); ensure_apksigner_sdk()
     info("Install Python modules"); pip_install(PY_MODULES)
     if not no_public_downloads:
         info("Download public upstream tools")
